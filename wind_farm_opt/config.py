@@ -44,6 +44,7 @@ class EconomicConfig:
     """经济性分析配置。"""
     electricity_price: float = 0.45
     discount_rate: float = 0.06
+    inflation_rate: float = 0.025
     enable_analysis: bool = True
 
 

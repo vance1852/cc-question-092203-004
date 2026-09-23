@@ -194,6 +194,7 @@ class WindFarmOptimizerCLI:
         turbine_cost = get_default_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
         farm_cost.discount_rate = self.config.economic.discount_rate
+        farm_cost.inflation_rate = self.config.economic.inflation_rate
 
         analyzer = EconomicAnalyzer(
             turbine_cost=turbine_cost,
@@ -208,24 +209,52 @@ class WindFarmOptimizerCLI:
             net_aep_GWh=result.net_aep / 1e3,
         )
 
+        er = self.economic_result
         print(f"\n--- 经济性分析结果（基于优化后布局） ---")
         print(f"  上网电价:      {self.config.economic.electricity_price:.2f} 元/kWh")
-        print(f"  折现率:        {self.config.economic.discount_rate*100:.1f}%")
-        print(f"  初始投资:      {self.economic_result.total_capital_cost/1e4:.2f} 亿元")
-        print(f"  年运维费用:    {self.economic_result.total_om_cost_annual:.1f} 万元/年")
-        print(f"  年发电收益:    {self.economic_result.annual_revenue:.1f} 万元/年")
-        print(f"  度电成本:      {self.economic_result.lcoe:.3f} 元/kWh")
+        print(
+            f"  折现率:        名义 {self.config.economic.discount_rate*100:.2f}%"
+            f" / 通胀 {self.config.economic.inflation_rate*100:.2f}%"
+            f" / 实际 {((1+self.config.economic.discount_rate)/(1+self.config.economic.inflation_rate)-1)*100:.3f}%"
+        )
+        print(f"  初始投资:      {er.total_capital_cost/1e4:.2f} 亿元")
+        print(f"  年运维费用:    {er.total_om_cost_annual:.1f} 万元/年")
+        print(f"  退役费用:      {er.decommissioning_cost:.1f} 万元（寿命期末，"
+              f"现值 {er.decommissioning_cost_pv:.1f} 万元）")
+        print(f"  寿命期成本现值:{er.lifecycle_cost_pv/1e4:.2f} 亿元")
+        print(f"  年发电收益:    {er.annual_revenue:.1f} 万元/年")
+        if er.lcoe_status == "ok":
+            print(f"  度电成本:      {er.lcoe:.3f} 元/kWh")
+        else:
+            print("  度电成本:      无有效发电量，LCOE 不可定义 (inf)")
 
-        if self.economic_result.npv is not None:
-            print(f"  净现值(NPV):   {self.economic_result.npv/1e4:+.2f} 亿元")
-        if self.economic_result.irr is not None:
-            print(f"  内部收益率:    {self.economic_result.irr:.2f}%")
-        if self.economic_result.payback_period is not None:
-            print(f"  投资回收期:    {self.economic_result.payback_period:.1f} 年")
+        if er.npv is not None:
+            print(f"  净现值(NPV):   {er.npv/1e4:+.2f} 亿元")
 
-        print(f"\n  成本构成:")
-        for item, cost in self.economic_result.cost_breakdown.items():
-            pct = cost / self.economic_result.total_capital_cost * 100
+        irr_res = er.irr_result
+        if irr_res is not None:
+            if irr_res.status == "unique":
+                nominal_txt = (
+                    f"，名义 {irr_res.irr_nominal_pct:.2f}%"
+                    if irr_res.irr_nominal_pct is not None
+                    else ""
+                )
+                print(f"  内部收益率:    {irr_res.irr_pct:.2f}%（实际{nominal_txt}）")
+            elif irr_res.status == "multiple":
+                roots = "、".join(f"{x:.2f}%" for x in irr_res.all_irr_pct)
+                print(f"  内部收益率:    存在多个根 [{roots}]，单一 IRR 不适用")
+                print(f"                 {irr_res.message}")
+            else:
+                print(f"  内部收益率:    无解（{irr_res.status}：{irr_res.message}）")
+
+        if er.payback_period is not None:
+            print(f"  投资回收期:    {er.payback_period:.1f} 年")
+        else:
+            print("  投资回收期:    寿命期内无法收回")
+
+        print(f"\n  初始投资构成:")
+        for item, cost in er.cost_breakdown.items():
+            pct = cost / er.total_capital_cost * 100
             print(f"    {item}: {cost/1e4:.2f} 亿元 ({pct:.1f}%)")
 
     def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 2) -> None:
@@ -246,6 +275,8 @@ class WindFarmOptimizerCLI:
 
         turbine_cost = get_default_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
+        farm_cost.discount_rate = self.config.economic.discount_rate
+        farm_cost.inflation_rate = self.config.economic.inflation_rate
         analyzer = EconomicAnalyzer(
             turbine_cost=turbine_cost,
             farm_cost=farm_cost,
@@ -449,13 +480,48 @@ class WindFarmOptimizerCLI:
             }
 
         if self.economic_result is not None:
+            er = self.economic_result
+            irr_res = er.irr_result
             results["economic"] = {
-                "total_capital_cost_yiyuan": float(self.economic_result.total_capital_cost / 1e4),
-                "annual_revenue_wanyuan": float(self.economic_result.annual_revenue),
-                "lcoe_yuan_per_kwh": float(self.economic_result.lcoe),
-                "npv_yiyuan": float(self.economic_result.npv / 1e4) if self.economic_result.npv is not None else None,
-                "irr_pct": float(self.economic_result.irr) if self.economic_result.irr is not None else None,
-                "payback_years": float(self.economic_result.payback_period) if self.economic_result.payback_period is not None else None,
+                "discount_rate_nominal": float(self.config.economic.discount_rate),
+                "inflation_rate": float(self.config.economic.inflation_rate),
+                "discount_rate_real": float(
+                    (1 + self.config.economic.discount_rate)
+                    / (1 + self.config.economic.inflation_rate) - 1
+                ),
+                "electricity_price_yuan_per_kwh": float(
+                    self.config.economic.electricity_price
+                ),
+                "total_capital_cost_wanyuan": float(er.total_capital_cost),
+                "total_capital_cost_yiyuan": float(er.total_capital_cost / 1e4),
+                "annual_om_cost_wanyuan": float(er.total_om_cost_annual),
+                "annual_revenue_wanyuan": float(er.annual_revenue),
+                "decommissioning_cost_wanyuan": float(er.decommissioning_cost),
+                "decommissioning_cost_pv_wanyuan": float(er.decommissioning_cost_pv),
+                "lifecycle_cost_pv_wanyuan": float(er.lifecycle_cost_pv),
+                "lcoe_yuan_per_kwh": (
+                    float(er.lcoe) if np.isfinite(er.lcoe) else None
+                ),
+                "lcoe_status": er.lcoe_status,
+                "npv_wanyuan": float(er.npv),
+                "npv_yiyuan": float(er.npv / 1e4),
+                "irr_pct": float(er.irr) if er.irr is not None else None,
+                "irr_nominal_pct": (
+                    float(irr_res.irr_nominal_pct)
+                    if irr_res is not None and irr_res.irr_nominal_pct is not None
+                    else None
+                ),
+                "irr_status": irr_res.status if irr_res is not None else None,
+                "all_irr_pct": (
+                    [float(x) for x in irr_res.all_irr_pct]
+                    if irr_res is not None
+                    else []
+                ),
+                "irr_message": irr_res.message if irr_res is not None else None,
+                "payback_years": float(er.payback_period) if er.payback_period is not None else None,
+                "cost_breakdown_wanyuan": {
+                    k: float(v) for k, v in er.cost_breakdown.items()
+                },
             }
 
         if self.baseline_result is not None and self.optimized_result is not None:
@@ -690,7 +756,14 @@ def build_argparser() -> argparse.ArgumentParser:
         "--discount-rate",
         type=float,
         default=None,
-        help="折现率 (0-1)",
+        help="名义折现率 (0-1)，等于通胀率时为平价情景（实际折现率为 0）",
+    )
+
+    parser.add_argument(
+        "--inflation-rate",
+        type=float,
+        default=None,
+        help="通货膨胀率 (0-1)",
     )
 
     parser.add_argument(
@@ -773,6 +846,8 @@ def main() -> int:
         config.economic.electricity_price = args.electricity_price
     if args.discount_rate is not None:
         config.economic.discount_rate = args.discount_rate
+    if args.inflation_rate is not None:
+        config.economic.inflation_rate = args.inflation_rate
     if args.output_dir is not None:
         config.visualization.save_dir = args.output_dir
     if args.no_plots:

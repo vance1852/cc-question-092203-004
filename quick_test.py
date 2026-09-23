@@ -158,10 +158,32 @@ econ_result = analyzer.analyze(
 print(f"   ✓ 度电成本(LCOE): {econ_result.lcoe:.3f} 元/kWh")
 print(f"   ✓ 初始投资: {econ_result.total_capital_cost/1e4:.2f} 亿元")
 print(f"   ✓ 年收益: {econ_result.annual_revenue:.0f} 万元")
+print(f"   ✓ 退役费用(期末): {econ_result.decommissioning_cost:.0f} 万元, "
+      f"现值 {econ_result.decommissioning_cost_pv:.0f} 万元")
 if econ_result.payback_period:
     print(f"   ✓ 投资回收期: {econ_result.payback_period:.1f} 年")
-if econ_result.irr:
-    print(f"   ✓ 内部收益率: {econ_result.irr:.2f}%")
+if econ_result.irr is not None:
+    print(f"   ✓ 内部收益率: {econ_result.irr:.2f}% (实际)")
+else:
+    print(f"   ✓ 内部收益率无解/多根: {econ_result.irr_result.status}")
+
+# 平价情景（名义折现率 = 通胀率，实际折现率为 0）不应除零
+farm_cost_parity = get_default_farm_cost()
+farm_cost_parity.discount_rate = farm_cost_parity.inflation_rate
+parity_analyzer = EconomicAnalyzer(turb_cost, farm_cost_parity, electricity_price=0.45)
+parity_npv = parity_analyzer.compute_npv(30000.0, 2000.0, 500.0, decommissioning_cost=414.0)
+assert abs(parity_npv - (-30000.0 + 1500.0 * 25.0 - 414.0)) < 1e-6
+parity_lcoe = parity_analyzer.compute_lcoe(30000.0, 500.0, 100.0, decommissioning_cost=414.0)
+assert np.isfinite(parity_lcoe) and parity_lcoe > 0
+print(f"   ✓ 平价情景(实际折现率=0): NPV={parity_npv:.0f} 万元, LCOE={parity_lcoe:.4f} 元/kWh")
+
+# 亏损项目应能求出负的 IRR；无发电量时 LCOE 为 inf
+loss_irr = analyzer.compute_irr(12000.0, 400.0, 0.0)
+assert loss_irr.status == "unique" and loss_irr.irr_pct < 0
+print(f"   ✓ 亏损项目负 IRR: {loss_irr.irr_pct:.3f}%")
+no_energy = analyzer.analyze(n_turb, turb.rated_power/1e3, 0.0)
+assert not np.isfinite(no_energy.lcoe) and no_energy.lcoe_status == "no_energy"
+print("   ✓ 无有效发电量: LCOE=inf (status=no_energy)，NPV 仍可计算")
 
 print("\n9. 测试可视化模块...")
 from wind_farm_opt.visualization.plotting import (
