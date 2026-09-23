@@ -155,13 +155,22 @@ econ_result = analyzer.analyze(
     rated_power_per_turbine_MW=turb.rated_power/1e3,
     net_aep_GWh=opt_result.best_fitness/1e3,
 )
-print(f"   ✓ 度电成本(LCOE): {econ_result.lcoe:.3f} 元/kWh")
+print(f"   ✓ 实际折现率: {econ_result.real_discount_rate*100:.2f}%")
 print(f"   ✓ 初始投资: {econ_result.total_capital_cost/1e4:.2f} 亿元")
+print(f"   ✓ 退役费用(期末): {econ_result.decommissioning_cost/1e4:.2f} 亿元")
 print(f"   ✓ 年收益: {econ_result.annual_revenue:.0f} 万元")
-if econ_result.payback_period:
+if econ_result.lcoe is not None:
+    print(f"   ✓ 度电成本(LCOE): {econ_result.lcoe:.3f} 元/kWh")
+else:
+    print("   ✓ 度电成本(LCOE): N/A（无有效发电量）")
+if econ_result.npv is not None:
+    print(f"   ✓ 净现值(NPV): {econ_result.npv/1e4:+.2f} 亿元")
+if econ_result.irr is not None:
+    print(f"   ✓ 内部收益率: {econ_result.irr:.2f}% ({econ_result.irr_status})")
+else:
+    print(f"   ✓ 内部收益率: 无解 ({econ_result.irr_status})")
+if econ_result.payback_period is not None:
     print(f"   ✓ 投资回收期: {econ_result.payback_period:.1f} 年")
-if econ_result.irr:
-    print(f"   ✓ 内部收益率: {econ_result.irr:.2f}%")
 
 print("\n9. 测试可视化模块...")
 from wind_farm_opt.visualization.plotting import (

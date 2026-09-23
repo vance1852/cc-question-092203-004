@@ -178,6 +178,18 @@ class WindFarmOptimizerCLI:
             print(f"  尾流损失减少: {loss_reduction:+.2f}%")
             print(f"  额外发电量:   {(self.optimized_result.net_aep - self.baseline_result.net_aep)/1e3:+.2f} GWh/年")
 
+    def _create_economic_analyzer(self) -> EconomicAnalyzer:
+        """按当前配置创建经济性分析器（经济分析与台数扫描共用同一组参数）。"""
+        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        farm_cost = get_default_farm_cost()
+        farm_cost.discount_rate = self.config.economic.discount_rate
+        farm_cost.inflation_rate = self.config.economic.inflation_rate
+        return EconomicAnalyzer(
+            turbine_cost=turbine_cost,
+            farm_cost=farm_cost,
+            electricity_price=self.config.economic.electricity_price,
+        )
+
     def run_economic_analysis(self) -> None:
         """运行经济性分析。"""
         if not self.config.economic.enable_analysis:
@@ -191,15 +203,7 @@ class WindFarmOptimizerCLI:
         else:
             result = self.optimized_result
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
-        farm_cost = get_default_farm_cost()
-        farm_cost.discount_rate = self.config.economic.discount_rate
-
-        analyzer = EconomicAnalyzer(
-            turbine_cost=turbine_cost,
-            farm_cost=farm_cost,
-            electricity_price=self.config.economic.electricity_price,
-        )
+        analyzer = self._create_economic_analyzer()
 
         rated_power_MW = self.turbines[0].rated_power / 1e3
         self.economic_result = analyzer.analyze(
@@ -208,24 +212,44 @@ class WindFarmOptimizerCLI:
             net_aep_GWh=result.net_aep / 1e3,
         )
 
+        er = self.economic_result
         print(f"\n--- 经济性分析结果（基于优化后布局） ---")
         print(f"  上网电价:      {self.config.economic.electricity_price:.2f} 元/kWh")
-        print(f"  折现率:        {self.config.economic.discount_rate*100:.1f}%")
-        print(f"  初始投资:      {self.economic_result.total_capital_cost/1e4:.2f} 亿元")
-        print(f"  年运维费用:    {self.economic_result.total_om_cost_annual:.1f} 万元/年")
-        print(f"  年发电收益:    {self.economic_result.annual_revenue:.1f} 万元/年")
-        print(f"  度电成本:      {self.economic_result.lcoe:.3f} 元/kWh")
+        print(f"  名义折现率:    {self.config.economic.discount_rate*100:.1f}%")
+        print(f"  通货膨胀率:    {self.config.economic.inflation_rate*100:.1f}%")
+        print(f"  实际折现率:    {er.real_discount_rate*100:.2f}%")
+        print(f"  运营寿命:      {er.lifetime:.0f} 年")
+        print(f"  初始投资:      {er.total_capital_cost/1e4:.2f} 亿元")
+        print(f"  退役费用(期末): {er.decommissioning_cost/1e4:.2f} 亿元")
+        print(f"  年运维费用:    {er.total_om_cost_annual:.1f} 万元/年")
+        print(f"  年发电收益:    {er.annual_revenue:.1f} 万元/年")
 
-        if self.economic_result.npv is not None:
-            print(f"  净现值(NPV):   {self.economic_result.npv/1e4:+.2f} 亿元")
-        if self.economic_result.irr is not None:
-            print(f"  内部收益率:    {self.economic_result.irr:.2f}%")
-        if self.economic_result.payback_period is not None:
-            print(f"  投资回收期:    {self.economic_result.payback_period:.1f} 年")
+        if er.lcoe is not None:
+            print(f"  度电成本:      {er.lcoe:.3f} 元/kWh")
+        else:
+            print(f"  度电成本:      N/A（无有效发电量）")
 
-        print(f"\n  成本构成:")
-        for item, cost in self.economic_result.cost_breakdown.items():
-            pct = cost / self.economic_result.total_capital_cost * 100
+        if er.npv is not None:
+            print(f"  净现值(NPV):   {er.npv/1e4:+.2f} 亿元")
+
+        if er.irr is not None:
+            if er.irr_status == "multiple":
+                roots_str = ", ".join(f"{r:.2f}%" for r in er.irr_roots)
+                print(f"  内部收益率:    {er.irr:.2f}%（多解，取绝对值最小者；全部解: {roots_str}）")
+            else:
+                print(f"  内部收益率:    {er.irr:.2f}%")
+        else:
+            print(f"  内部收益率:    无解（寿命期现金流无符号变化）")
+
+        if er.payback_period is not None:
+            print(f"  投资回收期:    {er.payback_period:.1f} 年（静态）")
+        else:
+            print(f"  投资回收期:    不可回收（年净现金流非正）")
+
+        total_lifetime_cost = er.total_capital_cost + er.decommissioning_cost
+        print(f"\n  成本构成（全寿命口径，合计 {total_lifetime_cost/1e4:.2f} 亿元）:")
+        for item, cost in er.cost_breakdown.items():
+            pct = cost / total_lifetime_cost * 100 if total_lifetime_cost > 0 else 0.0
             print(f"    {item}: {cost/1e4:.2f} 亿元 ({pct:.1f}%)")
 
     def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 2) -> None:
@@ -242,58 +266,75 @@ class WindFarmOptimizerCLI:
         }
 
         rng = np.random.default_rng(self.config.optimization.seed)
-        original_n = self.config.n_turbines
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
-        farm_cost = get_default_farm_cost()
-        analyzer = EconomicAnalyzer(
-            turbine_cost=turbine_cost,
-            farm_cost=farm_cost,
-            electricity_price=self.config.economic.electricity_price,
+        # 扫描会改动风机台数相关状态，先保存现场，结束后恢复，
+        # 否则后续可视化/结果保存会因数组尺寸不一致而中止
+        saved_state = (
+            self.config.n_turbines,
+            self.turbines,
+            self.rotor_diameters,
+            self.rated_powers,
+            self.thrust_coefficients,
+            self.aep_calc,
         )
 
-        for n in range(min_turbines, max_turbines + 1, step):
-            print(f"\n  分析 {n} 台风机...")
-            self.config.n_turbines = n
-            self.turbines = [self.turbines[0] for _ in range(n)]
-            self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
-            self.rated_powers = np.array([t.rated_power for t in self.turbines])
+        analyzer = self._create_economic_analyzer()
 
-            self.aep_calc = AEPCalculator(
-                turbines=self.turbines,
-                wind_resource=self.wind_resource,
-                wake_model=self.wake_model,
-                wake_superposition=self.config.superposition_method,
-            )
+        try:
+            for n in range(min_turbines, max_turbines + 1, step):
+                print(f"\n  分析 {n} 台风机...")
+                self.config.n_turbines = n
+                self.turbines = [self.turbines[0] for _ in range(n)]
+                self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
+                self.rated_powers = np.array([t.rated_power for t in self.turbines])
 
-            try:
-                positions = generate_grid_layout(
-                    boundary=self.boundary,
-                    n_turbines=n,
-                    rotor_diameters=self.rotor_diameters,
-                    min_multiple=self.config.optimization.min_spacing_multiple,
-                    rng=rng,
+                self.aep_calc = AEPCalculator(
+                    turbines=self.turbines,
+                    wind_resource=self.wind_resource,
+                    wake_model=self.wake_model,
+                    wake_superposition=self.config.superposition_method,
                 )
 
-                result = self.aep_calc.compute_farm_aep(positions)
+                try:
+                    positions = generate_grid_layout(
+                        boundary=self.boundary,
+                        n_turbines=n,
+                        rotor_diameters=self.rotor_diameters,
+                        min_multiple=self.config.optimization.min_spacing_multiple,
+                        rng=rng,
+                    )
 
-                rated_power_MW = self.turbines[0].rated_power / 1e3
-                econ_result = analyzer.analyze(
-                    n_turbines=n,
-                    rated_power_per_turbine_MW=rated_power_MW,
-                    net_aep_GWh=result.net_aep / 1e3,
-                )
+                    result = self.aep_calc.compute_farm_aep(positions)
 
-                sweep_data["n_turbines"].append(n)
-                sweep_data["aep"].append(result.net_aep)
-                sweep_data["lcoe"].append(econ_result.lcoe)
+                    rated_power_MW = self.turbines[0].rated_power / 1e3
+                    econ_result = analyzer.analyze(
+                        n_turbines=n,
+                        rated_power_per_turbine_MW=rated_power_MW,
+                        net_aep_GWh=result.net_aep / 1e3,
+                    )
 
-                print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
-            except Exception as e:
-                print(f"    跳过: {e}")
+                    sweep_data["n_turbines"].append(n)
+                    sweep_data["aep"].append(result.net_aep)
+                    # 无有效发电量时 LCOE 为 None，扫描曲线中以 NaN 占位
+                    sweep_data["lcoe"].append(
+                        econ_result.lcoe if econ_result.lcoe is not None else float("nan")
+                    )
+
+                    lcoe_str = f"{econ_result.lcoe:.3f}" if econ_result.lcoe is not None else "N/A"
+                    print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {lcoe_str} 元/kWh")
+                except Exception as e:
+                    print(f"    跳过: {e}")
+        finally:
+            (
+                self.config.n_turbines,
+                self.turbines,
+                self.rotor_diameters,
+                self.rated_powers,
+                self.thrust_coefficients,
+                self.aep_calc,
+            ) = saved_state
 
         self.sweep_results = sweep_data
-        self.config.n_turbines = original_n
 
     def run_visualization(self) -> None:
         """生成所有可视化图表。"""
@@ -449,13 +490,26 @@ class WindFarmOptimizerCLI:
             }
 
         if self.economic_result is not None:
+            er = self.economic_result
             results["economic"] = {
-                "total_capital_cost_yiyuan": float(self.economic_result.total_capital_cost / 1e4),
-                "annual_revenue_wanyuan": float(self.economic_result.annual_revenue),
-                "lcoe_yuan_per_kwh": float(self.economic_result.lcoe),
-                "npv_yiyuan": float(self.economic_result.npv / 1e4) if self.economic_result.npv is not None else None,
-                "irr_pct": float(self.economic_result.irr) if self.economic_result.irr is not None else None,
-                "payback_years": float(self.economic_result.payback_period) if self.economic_result.payback_period is not None else None,
+                "electricity_price_yuan_per_kwh": float(self.config.economic.electricity_price),
+                "discount_rate_nominal": float(self.config.economic.discount_rate),
+                "inflation_rate": float(self.config.economic.inflation_rate),
+                "real_discount_rate": float(er.real_discount_rate),
+                "lifetime_years": float(er.lifetime),
+                "total_installed_capacity_mw": float(er.total_installed_capacity),
+                "net_aep_gwh": float(er.net_aep),
+                "total_capital_cost_yiyuan": float(er.total_capital_cost / 1e4),
+                "decommissioning_cost_yiyuan": float(er.decommissioning_cost / 1e4),
+                "annual_om_cost_wanyuan": float(er.total_om_cost_annual),
+                "annual_revenue_wanyuan": float(er.annual_revenue),
+                "lcoe_yuan_per_kwh": float(er.lcoe) if er.lcoe is not None else None,
+                "npv_yiyuan": float(er.npv / 1e4) if er.npv is not None else None,
+                "irr_pct": float(er.irr) if er.irr is not None else None,
+                "irr_status": er.irr_status,
+                "irr_all_roots_pct": [float(r) for r in er.irr_roots],
+                "payback_years": float(er.payback_period) if er.payback_period is not None else None,
+                "cost_breakdown_wanyuan": {k: float(v) for k, v in er.cost_breakdown.items()},
             }
 
         if self.baseline_result is not None and self.optimized_result is not None:
@@ -690,7 +744,14 @@ def build_argparser() -> argparse.ArgumentParser:
         "--discount-rate",
         type=float,
         default=None,
-        help="折现率 (0-1)",
+        help="名义折现率 (0-1)",
+    )
+
+    parser.add_argument(
+        "--inflation-rate",
+        type=float,
+        default=None,
+        help="通货膨胀率 (0-1)，与名义折现率相等时为平价情景（实际折现率为0）",
     )
 
     parser.add_argument(
@@ -773,6 +834,8 @@ def main() -> int:
         config.economic.electricity_price = args.electricity_price
     if args.discount_rate is not None:
         config.economic.discount_rate = args.discount_rate
+    if args.inflation_rate is not None:
+        config.economic.inflation_rate = args.inflation_rate
     if args.output_dir is not None:
         config.visualization.save_dir = args.output_dir
     if args.no_plots:
